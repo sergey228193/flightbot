@@ -41,6 +41,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
 )
+from aiogram.exceptions import TelegramBadRequest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -66,7 +67,6 @@ TIMEZONE = "Europe/Moscow"
 MOSCOW = "MOW"
 SPB = "LED"
 KRASNODAR = "KRR"
-
 LONDON = "LON"
 CORFU = "CFU"
 BANGKOK = "BKK"
@@ -84,9 +84,9 @@ class Route:
     destination_name: str
     # Справочная информация (примерная, не из API) — показывается в скобках
     # рядом с названием маршрута, чтобы сразу было понятно, чего ждать.
-    transfer_hint: Optional[str] = None      # где обычно пересадка
-    approx_duration: str = ""                # сколько примерно лететь суммарно
-    approx_arrival: str = ""                  # когда примерно приземление
+    transfer_hint: Optional[str] = None  # где обычно пересадка
+    approx_duration: str = ""  # сколько примерно лететь суммарно
+    approx_arrival: str = ""  # когда примерно приземление
 
 
 @dataclass(frozen=True)
@@ -188,7 +188,6 @@ PEOPLE = {
 # перезапусками нужно заменить на файл/БД — могу добавить по запросу.
 CHAT_TO_PERSON: dict[int, str] = {}
 
-
 # ---------------------------------------------------------------------------
 # ЗАПРОСЫ К TRAVELPAYOUTS (Aviasales GraphQL Flight Data API)
 # ---------------------------------------------------------------------------
@@ -196,6 +195,7 @@ CHAT_TO_PERSON: dict[int, str] = {}
 # времени — поэтому раньше бот всегда писал "время уточняется". Точное
 # время вылета (departure_at) и продолжительность полёта (trip_duration)
 # отдаёт только GraphQL-эндпоинт, поэтому используем именно его.
+
 GRAPHQL_URL = "https://api.travelpayouts.com/graphql/v1/query"
 
 # Поля, которые пробуем запросить сначала (расширенный набор).
@@ -222,21 +222,21 @@ def _month_starts(start: date, end: date) -> list[str]:
 def _build_query(origin: str, destination: str, depart_month: str, fields: str, with_currency: bool) -> str:
     currency_line = f'currency: "{CURRENCY}"' if with_currency else ""
     return f"""
-    {{
-      prices_one_way(
-        params: {{
-          origin: "{origin}"
-          destination: "{destination}"
-          depart_months: "{depart_month}"
-          {currency_line}
-        }}
-        paging: {{ limit: 30, offset: 0 }}
-        sorting: VALUE_ASC
-      ) {{
-        {fields}
-      }}
+{{
+  prices_one_way(
+    params: {{
+      origin: "{origin}"
+      destination: "{destination}"
+      depart_months: "{depart_month}"
+      {currency_line}
     }}
-    """
+    paging: {{ limit: 30, offset: 0 }}
+    sorting: VALUE_ASC
+  ) {{
+    {fields}
+  }}
+}}
+"""
 
 
 async def _graphql_request(session: aiohttp.ClientSession, query: str) -> Optional[dict]:
@@ -272,6 +272,7 @@ async def fetch_flights_for_route(session: aiohttp.ClientSession, route: Route) 
     """
     Возвращает найденные варианты перелёта по маршруту с реальным временем
     вылета, отсортированные по дате, с датой вылета не позднее DEADLINE.
+
     Данные — из кэша Aviasales (реально найденные билеты за недавнее время),
     а не «расписание вообще всех рейсов» — если по каким-то датам никто
     ничего не искал/покупал, по ним не будет данных вовсе.
@@ -313,12 +314,21 @@ async def fetch_flights_for_route(session: aiohttp.ClientSession, route: Route) 
 
 
 def format_flight_item(item: dict) -> str:
+    """
+    Красивая карточка рейса:
+
+    📅 05.08.2026
+    🛫 06:35 -- 🛬 14:20 (+1д.)
+    ⏱ 8ч 45м
+    💵 45000 RUB
+    ✈️ Turkish Airlines · 1 пересадка
+    """
     dep_dt = _parse_departure(item)
     price = item.get("value", "?")
     airline = item.get("airline", "—")
     duration_min = item.get("trip_duration")
-
     transfers = item.get("number_of_changes")
+
     if transfers is None:
         transfers_txt = ""
     elif transfers == 0:
@@ -327,56 +337,70 @@ def format_flight_item(item: dict) -> str:
         transfers_txt = f"{transfers} пересадк{'а' if transfers == 1 else 'и'}"
 
     if dep_dt is None:
-        return f"📅 ? — {price} {CURRENCY.upper()} · ✈️ {airline}"
+        block = [
+            "📅 дата уточняется",
+            f"💵 {price} {CURRENCY.upper()}",
+            f"✈️ {airline}",
+        ]
+        return "\n".join(block)
 
     has_time = item.get("departure_at") is not None
     date_part = dep_dt.strftime("%d.%m.%Y")
 
+    lines = [f"📅 <b>{date_part}</b>"]
     night_markers = []
 
     if has_time:
         dep_time_txt = dep_dt.strftime("%H:%M")
         if _is_night_hour(dep_dt.hour):
             night_markers.append("вылет ночью")
-        line = f"📅 {date_part} 🛫 {dep_time_txt}"
 
         if duration_min:
             try:
                 duration_min = int(duration_min)
                 arrival_dt = dep_dt + timedelta(minutes=duration_min)
                 arr_time_txt = arrival_dt.strftime("%H:%M")
+
                 # если прилёт на следующие сутки — отметим это
                 day_shift = (arrival_dt.date() - dep_dt.date()).days
                 day_note = f" (+{day_shift}д.)" if day_shift else ""
-                line += f" → 🛬 {arr_time_txt}{day_note}"
+
+                lines.append(f"🛫 {dep_time_txt} -- 🛬 {arr_time_txt}{day_note}")
+
                 if _is_night_hour(arrival_dt.hour):
                     night_markers.append("прилёт ночью")
 
                 hours, minutes = divmod(duration_min, 60)
                 duration_txt = f"{hours}ч {minutes:02d}м" if hours else f"{minutes}м"
-                line += f" · ⏱ {duration_txt}"
+                lines.append(f"⏱ {duration_txt}")
             except (TypeError, ValueError):
-                pass
+                lines.append(f"🛫 {dep_time_txt} -- 🛬 время прилёта уточняется")
+                lines.append("⏱ длительность уточняется")
         else:
-            line += " · ⏱ длительность неизвестна"
+            lines.append(f"🛫 {dep_time_txt} -- 🛬 время прилёта уточняется")
+            lines.append("⏱ длительность уточняется")
     else:
         # Только дата, без точного времени (агрегированные данные)
-        line = f"📅 {date_part} · время вылета уточняется на сайте"
+        lines.append("🛫 время вылета уточняется -- 🛬 время прилёта уточняется")
+        lines.append("⏱ длительность уточняется")
 
-    line += f" · {price} {CURRENCY.upper()} · ✈️ {airline}"
+    lines.append(f"💵 {price} {CURRENCY.upper()}")
+
+    extra = [f"✈️ {airline}"]
     if transfers_txt:
-        line += f" · {transfers_txt}"
-    if night_markers:
-        line += " · 🌙 " + ", ".join(night_markers)
+        extra.append(transfers_txt)
+    lines.append(" · ".join(extra))
 
-    return line
+    if night_markers:
+        lines.append("🌙 " + ", ".join(night_markers))
+
+    return "\n".join(lines)
 
 
 async def build_schedule_text(person: Person) -> str:
     lines = [
         f"<b>Расписание для {person.display_name}</b>",
-        f"(даты вылета до {DEADLINE.strftime('%d.%m.%Y')} включительно)",
-        "🛫 вылет · 🛬 прилёт · ⏱ длительность полёта · 🌙 ночной рейс\n",
+        f"(даты вылета до {DEADLINE.strftime('%d.%m.%Y')} включительно)\n",
     ]
 
     async with aiohttp.ClientSession() as session:
@@ -394,10 +418,14 @@ async def build_schedule_text(person: Person) -> str:
                 lines.append(f"<i>({'; '.join(hint_parts)})</i>")
 
             flights = await fetch_flights_for_route(session, route)
+
             if not flights:
                 lines.append("Нет данных / вариантов на эту дату в кэше Aviasales.")
                 continue
-            for item in flights[:10]:
+
+            for i, item in enumerate(flights[:10]):
+                if i > 0:
+                    lines.append("➖➖➖➖➖➖➖➖")
                 lines.append(format_flight_item(item))
 
     if any(r.destination in (LONDON, CORFU, BERLIN) for r in person.routes):
@@ -472,10 +500,25 @@ async def handle_refresh(callback: CallbackQuery) -> None:
     if not person_key:
         await callback.answer("Сначала выбери, кто ты, через /start", show_alert=True)
         return
+
     person = PEOPLE[person_key]
     await callback.answer("Обновляю…")
+
     text = await build_schedule_text(person)
-    await callback.message.answer(text, reply_markup=refresh_keyboard())
+
+    chat_id = callback.message.chat.id
+    old_message_id = callback.message.message_id
+
+    # Сначала отправляем новое сообщение, потом удаляем старое —
+    # так пользователь не остаётся без сообщения, если удаление вдруг не удастся.
+    new_message = await callback.bot.send_message(chat_id, text, reply_markup=refresh_keyboard())
+
+    try:
+        await callback.bot.delete_message(chat_id, old_message_id)
+    except TelegramBadRequest as exc:
+        log.warning("Не удалось удалить старое сообщение %s в чате %s: %s", old_message_id, chat_id, exc)
+
+    _ = new_message  # оставлено для наглядности, можно расширить логику при желании
 
 
 async def daily_broadcast(bot: Bot) -> None:
