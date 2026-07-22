@@ -26,7 +26,7 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 import aiohttp
@@ -41,6 +41,8 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
 )
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 # ---------------------------------------------------------------------------
 # НАСТРОЙКИ
@@ -54,6 +56,11 @@ CURRENCY = "rub"
 
 # Крайняя дата, до которой ищем рейсы (включительно)
 DEADLINE = date(2026, 8, 31)
+
+# Ежедневная автоматическая рассылка расписания (время по Москве)
+DAILY_UPDATE_HOUR = 9
+DAILY_UPDATE_MINUTE = 45
+TIMEZONE = "Europe/Moscow"
 
 # IATA-коды городов
 MOSCOW = "MOW"
@@ -125,8 +132,10 @@ PEOPLE = {
 }
 
 # Привязка chat_id -> человек. Хранится в памяти; при перезапуске бота
-# люди снова выберут себя через /start (это простое хранилище, для
-# постоянного хранения можно заменить на файл/БД).
+# (например, после каждого передеплоя на Railway) эта привязка теряется,
+# и ежедневная рассылка отправляться не будет, пока человек не напишет
+# /start и не выберет своё имя ещё раз. Для надёжного хранения между
+# перезапусками нужно заменить на файл/БД — могу добавить по запросу.
 CHAT_TO_PERSON: dict[int, str] = {}
 
 
@@ -137,13 +146,39 @@ CHAT_TO_PERSON: dict[int, str] = {}
 TP_CALENDAR_URL = "https://api.travelpayouts.com/v2/prices/latest"
 
 
+def _parse_departure(item: dict) -> Optional[datetime]:
+    """
+    Пытается получить дату+время вылета. API отдаёт либо полный ISO-таймстамп
+    в departure_at, либо просто дату в depart_date (без времени) — тогда
+    время неизвестно.
+    """
+    dep_at = item.get("departure_at")
+    if dep_at:
+        try:
+            # departure_at обычно вида "2026-08-05T06:35:00+03:00"
+            return datetime.fromisoformat(dep_at.replace("Z", "+00:00"))
+        except ValueError:
+            pass
+    dep_date_str = item.get("depart_date")
+    if dep_date_str:
+        try:
+            return datetime.strptime(dep_date_str, "%Y-%m-%d")
+        except ValueError:
+            return None
+    return None
+
+
+def _is_night_hour(hour: int) -> bool:
+    return hour >= 22 or hour < 6
+
+
 async def fetch_flights_for_route(session: aiohttp.ClientSession, route: Route) -> list[dict]:
     """
     Возвращает список найденных вариантов перелёта по маршруту, с датой
     вылета не позднее DEADLINE. Данные — из кэша Aviasales (реальные цены
-    и даты, которые люди покупали/искали в последнее время), это не
-    полное расписание "всех рейсов на завтра", а срез актуальных
-    доступных вариантов.
+    и билеты, которые люди недавно искали/покупали) — это не «расписание
+    вообще всех рейсов на каждый день», а срез актуальных доступных
+    вариантов с реальным временем вылета/прилёта, если оно известно.
     """
     params = {
         "origin": route.origin,
@@ -168,24 +203,22 @@ async def fetch_flights_for_route(session: aiohttp.ClientSession, route: Route) 
     results = data.get("data", []) if isinstance(data, dict) else []
     filtered = []
     for item in results:
-        dep_date_str = item.get("depart_date")
-        if not dep_date_str:
+        dep_dt = _parse_departure(item)
+        if dep_dt is None:
             continue
-        try:
-            dep_date = datetime.strptime(dep_date_str, "%Y-%m-%d").date()
-        except ValueError:
-            continue
-        if dep_date <= DEADLINE:
+        if dep_dt.date() <= DEADLINE:
             filtered.append(item)
 
-    filtered.sort(key=lambda x: x.get("depart_date", ""))
+    filtered.sort(key=lambda x: (_parse_departure(x) or datetime.max))
     return filtered
 
 
 def format_flight_item(item: dict) -> str:
-    dep = item.get("depart_date", "?")
+    dep_dt = _parse_departure(item)
     price = item.get("value", "?")
     airline = item.get("airline", "—")
+    duration_min = item.get("duration") or item.get("duration_to")
+
     transfers = item.get("number_of_changes")
     if transfers is None:
         transfers_txt = ""
@@ -193,11 +226,59 @@ def format_flight_item(item: dict) -> str:
         transfers_txt = "прямой рейс"
     else:
         transfers_txt = f"{transfers} пересадк{'а' if transfers == 1 else 'и'}"
-    return f"📅 {dep} — {price} {CURRENCY.upper()} · ✈️ {airline}" + (f" · {transfers_txt}" if transfers_txt else "")
+
+    if dep_dt is None:
+        return f"📅 ? — {price} {CURRENCY.upper()} · ✈️ {airline}"
+
+    has_time = item.get("departure_at") is not None
+    date_part = dep_dt.strftime("%d.%m.%Y")
+
+    night_markers = []
+
+    if has_time:
+        dep_time_txt = dep_dt.strftime("%H:%M")
+        if _is_night_hour(dep_dt.hour):
+            night_markers.append("вылет ночью")
+        line = f"📅 {date_part} 🛫 {dep_time_txt}"
+
+        if duration_min:
+            try:
+                duration_min = int(duration_min)
+                arrival_dt = dep_dt + timedelta(minutes=duration_min)
+                arr_time_txt = arrival_dt.strftime("%H:%M")
+                # если прилёт на следующие сутки — отметим это
+                day_shift = (arrival_dt.date() - dep_dt.date()).days
+                day_note = f" (+{day_shift}д.)" if day_shift else ""
+                line += f" → 🛬 {arr_time_txt}{day_note}"
+                if _is_night_hour(arrival_dt.hour):
+                    night_markers.append("прилёт ночью")
+
+                hours, minutes = divmod(duration_min, 60)
+                duration_txt = f"{hours}ч {minutes:02d}м" if hours else f"{minutes}м"
+                line += f" · ⏱ {duration_txt}"
+            except (TypeError, ValueError):
+                pass
+        else:
+            line += " · ⏱ длительность неизвестна"
+    else:
+        # Только дата, без точного времени (агрегированные данные)
+        line = f"📅 {date_part} · время вылета уточняется на сайте"
+
+    line += f" · {price} {CURRENCY.upper()} · ✈️ {airline}"
+    if transfers_txt:
+        line += f" · {transfers_txt}"
+    if night_markers:
+        line += " · 🌙 " + ", ".join(night_markers)
+
+    return line
 
 
 async def build_schedule_text(person: Person) -> str:
-    lines = [f"<b>Расписание для {person.display_name}</b>", f"(даты вылета до {DEADLINE.strftime('%d.%m.%Y')} включительно)\n"]
+    lines = [
+        f"<b>Расписание для {person.display_name}</b>",
+        f"(даты вылета до {DEADLINE.strftime('%d.%m.%Y')} включительно)",
+        "🛫 вылет · 🛬 прилёт · ⏱ длительность полёта · 🌙 ночной рейс\n",
+    ]
 
     async with aiohttp.ClientSession() as session:
         for route in person.routes:
@@ -287,10 +368,39 @@ async def handle_refresh(callback: CallbackQuery) -> None:
     await callback.message.answer(text, reply_markup=refresh_keyboard())
 
 
+async def daily_broadcast(bot: Bot) -> None:
+    """Отправляет каждому зарегистрированному пользователю свежее расписание."""
+    log.info("Запуск ежедневной рассылки расписания (%s пользователей)", len(CHAT_TO_PERSON))
+    for chat_id, person_key in list(CHAT_TO_PERSON.items()):
+        person = PEOPLE.get(person_key)
+        if not person:
+            continue
+        try:
+            text = await build_schedule_text(person)
+            await bot.send_message(chat_id, "🔔 Ежедневное обновление\n\n" + text, reply_markup=refresh_keyboard())
+        except Exception as exc:  # noqa: BLE001
+            log.error("Не удалось отправить рассылку в чат %s: %s", chat_id, exc)
+
+
 async def main() -> None:
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher()
     dp.include_router(router)
+
+    scheduler = AsyncIOScheduler(timezone=TIMEZONE)
+    scheduler.add_job(
+        daily_broadcast,
+        trigger=CronTrigger(hour=DAILY_UPDATE_HOUR, minute=DAILY_UPDATE_MINUTE),
+        args=[bot],
+    )
+    scheduler.start()
+    log.info(
+        "Планировщик запущен: ежедневная рассылка в %02d:%02d (%s)",
+        DAILY_UPDATE_HOUR,
+        DAILY_UPDATE_MINUTE,
+        TIMEZONE,
+    )
+
     log.info("Бот запущен")
     await dp.start_polling(bot)
 
