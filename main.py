@@ -200,8 +200,10 @@ GRAPHQL_URL = "https://api.travelpayouts.com/graphql/v1/query"
 
 # Поля, которые пробуем запросить сначала (расширенный набор).
 FIELDS_FULL = "departure_at value trip_duration number_of_changes airline"
+# Если запрос с currency почему-то падает, пробуем те же поля без currency —
+# так авиакомпания и длительность полёта не теряются зря.
 # Если API не знает какое-то из полей выше, откатываемся на минимальный набор,
-# который точно подтверждён документацией Travelpayouts.
+# который точно подтверждён документацией Travelpayouts (последний резерв).
 FIELDS_BASIC = "departure_at value trip_duration"
 
 
@@ -287,8 +289,15 @@ async def fetch_flights_for_route(session: aiohttp.ClientSession, route: Route) 
         data = await _graphql_request(session, query)
 
         if data is None or data.get("errors"):
-            # Попытка 2: минимальный набор полей, без currency —
-            # ровно как в официальном примере документации Travelpayouts
+            # Попытка 2: те же расширенные поля (авиакомпания, длительность,
+            # пересадки), но без currency — вдруг проблема была именно в нём.
+            query = _build_query(route.origin, route.destination, month, FIELDS_FULL, with_currency=False)
+            data = await _graphql_request(session, query)
+
+        if data is None or data.get("errors"):
+            # Попытка 3 (последний резерв): минимальный набор полей —
+            # ровно как в официальном примере документации Travelpayouts.
+            # Тут уже не будет airline/number_of_changes.
             query = _build_query(route.origin, route.destination, month, FIELDS_BASIC, with_currency=False)
             data = await _graphql_request(session, query)
 
@@ -313,7 +322,7 @@ async def fetch_flights_for_route(session: aiohttp.ClientSession, route: Route) 
     return filtered
 
 
-def format_flight_item(item: dict) -> str:
+def format_flight_item(item: dict, route: Route) -> str:
     """
     Красивая карточка рейса:
 
@@ -322,10 +331,15 @@ def format_flight_item(item: dict) -> str:
     ⏱ 8ч 45м
     💵 45000 RUB
     ✈️ Turkish Airlines · 1 пересадка
+
+    Если API не отдал точное время прилёта/длительность (так бывает —
+    Aviasales отдаёт их не для каждого найденного билета), вместо
+    "уточняется" подставляем ПРИМЕРНЫЕ данные маршрута (route.approx_*),
+    которые заданы вручную в PEOPLE — чтобы цифры были всегда, а не прочерк.
     """
     dep_dt = _parse_departure(item)
     price = item.get("value", "?")
-    airline = item.get("airline", "—")
+    airline = item.get("airline") or "уточняется"
     duration_min = item.get("trip_duration")
     transfers = item.get("number_of_changes")
 
@@ -335,6 +349,9 @@ def format_flight_item(item: dict) -> str:
         transfers_txt = "прямой рейс"
     else:
         transfers_txt = f"{transfers} пересадк{'а' if transfers == 1 else 'и'}"
+
+    approx_arrival_txt = route.approx_arrival or "время прилёта уточняется"
+    approx_duration_txt = route.approx_duration or "длительность уточняется"
 
     if dep_dt is None:
         block = [
@@ -374,15 +391,17 @@ def format_flight_item(item: dict) -> str:
                 duration_txt = f"{hours}ч {minutes:02d}м" if hours else f"{minutes}м"
                 lines.append(f"⏱ {duration_txt}")
             except (TypeError, ValueError):
-                lines.append(f"🛫 {dep_time_txt} -- 🛬 время прилёта уточняется")
-                lines.append("⏱ длительность уточняется")
+                # Точное время прилёта не посчиталось — подставляем примерное
+                lines.append(f"🛫 {dep_time_txt} -- 🛬 {approx_arrival_txt} (примерно)")
+                lines.append(f"⏱ {approx_duration_txt} (примерно)")
         else:
-            lines.append(f"🛫 {dep_time_txt} -- 🛬 время прилёта уточняется")
-            lines.append("⏱ длительность уточняется")
+            # API не отдал trip_duration для этого билета — подставляем примерное
+            lines.append(f"🛫 {dep_time_txt} -- 🛬 {approx_arrival_txt} (примерно)")
+            lines.append(f"⏱ {approx_duration_txt} (примерно)")
     else:
-        # Только дата, без точного времени (агрегированные данные)
-        lines.append("🛫 время вылета уточняется -- 🛬 время прилёта уточняется")
-        lines.append("⏱ длительность уточняется")
+        # API не отдал даже время вылета (только дату) — подставляем примерное
+        lines.append(f"🛫 время вылета уточняется -- 🛬 {approx_arrival_txt} (примерно)")
+        lines.append(f"⏱ {approx_duration_txt} (примерно)")
 
     lines.append(f"💵 {price} {CURRENCY.upper()}")
 
@@ -426,7 +445,7 @@ async def build_schedule_text(person: Person) -> str:
             for i, item in enumerate(flights[:10]):
                 if i > 0:
                     lines.append("➖➖➖➖➖➖➖➖")
-                lines.append(format_flight_item(item))
+                lines.append(format_flight_item(item, route))
 
     if any(r.destination in (LONDON, CORFU, BERLIN) for r in person.routes):
         lines.append(
