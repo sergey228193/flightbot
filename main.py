@@ -140,32 +140,78 @@ CHAT_TO_PERSON: dict[int, str] = {}
 
 
 # ---------------------------------------------------------------------------
-# ЗАПРОСЫ К TRAVELPAYOUTS (Aviasales Data API)
+# ЗАПРОСЫ К TRAVELPAYOUTS (Aviasales GraphQL Flight Data API)
 # ---------------------------------------------------------------------------
+# ВАЖНО: REST-эндпоинт v2/prices/latest отдаёт только ДАТУ вылета, без
+# времени — поэтому раньше бот всегда писал "время уточняется". Точное
+# время вылета (departure_at) и продолжительность полёта (trip_duration)
+# отдаёт только GraphQL-эндпоинт, поэтому используем именно его.
+GRAPHQL_URL = "https://api.travelpayouts.com/graphql/v1/query"
 
-TP_CALENDAR_URL = "https://api.travelpayouts.com/v2/prices/latest"
+# Поля, которые пробуем запросить сначала (расширенный набор).
+FIELDS_FULL = "departure_at value trip_duration number_of_changes airline"
+# Если API не знает какое-то из полей выше, откатываемся на минимальный набор,
+# который точно подтверждён документацией Travelpayouts.
+FIELDS_BASIC = "departure_at value trip_duration"
+
+
+def _month_starts(start: date, end: date) -> list[str]:
+    """Список первых чисел месяцев в диапазоне [start, end] в формате YYYY-MM-01."""
+    months = []
+    cursor = start.replace(day=1)
+    end_marker = end.replace(day=1)
+    while cursor <= end_marker:
+        months.append(cursor.strftime("%Y-%m-01"))
+        if cursor.month == 12:
+            cursor = cursor.replace(year=cursor.year + 1, month=1)
+        else:
+            cursor = cursor.replace(month=cursor.month + 1)
+    return months
+
+
+def _build_query(origin: str, destination: str, depart_month: str, fields: str, with_currency: bool) -> str:
+    currency_line = f'currency: "{CURRENCY}"' if with_currency else ""
+    return f"""
+    {{
+      prices_one_way(
+        params: {{
+          origin: "{origin}"
+          destination: "{destination}"
+          depart_months: "{depart_month}"
+          {currency_line}
+        }}
+        paging: {{ limit: 30, offset: 0 }}
+        sorting: VALUE_ASC
+      ) {{
+        {fields}
+      }}
+    }}
+    """
+
+
+async def _graphql_request(session: aiohttp.ClientSession, query: str) -> Optional[dict]:
+    headers = {"Content-Type": "application/json", "X-Access-Token": TRAVELPAYOUTS_TOKEN}
+    try:
+        async with session.post(GRAPHQL_URL, json={"query": query}, headers=headers, timeout=20) as resp:
+            data = await resp.json()
+            if resp.status != 200:
+                log.warning("GraphQL вернул статус %s: %s", resp.status, data)
+                return None
+            return data
+    except Exception as exc:  # noqa: BLE001
+        log.error("Ошибка GraphQL-запроса к Travelpayouts: %s", exc)
+        return None
 
 
 def _parse_departure(item: dict) -> Optional[datetime]:
-    """
-    Пытается получить дату+время вылета. API отдаёт либо полный ISO-таймстамп
-    в departure_at, либо просто дату в depart_date (без времени) — тогда
-    время неизвестно.
-    """
     dep_at = item.get("departure_at")
-    if dep_at:
-        try:
-            # departure_at обычно вида "2026-08-05T06:35:00+03:00"
-            return datetime.fromisoformat(dep_at.replace("Z", "+00:00"))
-        except ValueError:
-            pass
-    dep_date_str = item.get("depart_date")
-    if dep_date_str:
-        try:
-            return datetime.strptime(dep_date_str, "%Y-%m-%d")
-        except ValueError:
-            return None
-    return None
+    if not dep_at:
+        return None
+    try:
+        # departure_at приходит вида "2026-08-05T06:35:00+03:00"
+        return datetime.fromisoformat(dep_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def _is_night_hour(hour: int) -> bool:
@@ -174,35 +220,38 @@ def _is_night_hour(hour: int) -> bool:
 
 async def fetch_flights_for_route(session: aiohttp.ClientSession, route: Route) -> list[dict]:
     """
-    Возвращает список найденных вариантов перелёта по маршруту, с датой
-    вылета не позднее DEADLINE. Данные — из кэша Aviasales (реальные цены
-    и билеты, которые люди недавно искали/покупали) — это не «расписание
-    вообще всех рейсов на каждый день», а срез актуальных доступных
-    вариантов с реальным временем вылета/прилёта, если оно известно.
+    Возвращает найденные варианты перелёта по маршруту с реальным временем
+    вылета, отсортированные по дате, с датой вылета не позднее DEADLINE.
+    Данные — из кэша Aviasales (реально найденные билеты за недавнее время),
+    а не «расписание вообще всех рейсов» — если по каким-то датам никто
+    ничего не искал/покупал, по ним не будет данных вовсе.
     """
-    params = {
-        "origin": route.origin,
-        "destination": route.destination,
-        "currency": CURRENCY,
-        "period_type": "year",
-        "one_way": "true",
-        "sorting": "price",
-        "limit": 30,
-        "token": TRAVELPAYOUTS_TOKEN,
-    }
-    try:
-        async with session.get(TP_CALENDAR_URL, params=params, timeout=15) as resp:
-            if resp.status != 200:
-                log.warning("Travelpayouts вернул статус %s для %s->%s", resp.status, route.origin, route.destination)
-                return []
-            data = await resp.json()
-    except Exception as exc:  # noqa: BLE001
-        log.error("Ошибка запроса к Travelpayouts: %s", exc)
-        return []
+    today = datetime.utcnow().date()
+    months = _month_starts(today, DEADLINE)
 
-    results = data.get("data", []) if isinstance(data, dict) else []
+    all_items: list[dict] = []
+    for month in months:
+        # Попытка 1: расширенные поля + явная валюта
+        query = _build_query(route.origin, route.destination, month, FIELDS_FULL, with_currency=True)
+        data = await _graphql_request(session, query)
+
+        if data is None or data.get("errors"):
+            # Попытка 2: минимальный набор полей, без currency —
+            # ровно как в официальном примере документации Travelpayouts
+            query = _build_query(route.origin, route.destination, month, FIELDS_BASIC, with_currency=False)
+            data = await _graphql_request(session, query)
+
+        if not data:
+            continue
+        if data.get("errors"):
+            log.warning("GraphQL errors для %s->%s (%s): %s", route.origin, route.destination, month, data["errors"])
+            continue
+
+        items = (data.get("data") or {}).get("prices_one_way") or []
+        all_items.extend(items)
+
     filtered = []
-    for item in results:
+    for item in all_items:
         dep_dt = _parse_departure(item)
         if dep_dt is None:
             continue
@@ -217,7 +266,7 @@ def format_flight_item(item: dict) -> str:
     dep_dt = _parse_departure(item)
     price = item.get("value", "?")
     airline = item.get("airline", "—")
-    duration_min = item.get("duration") or item.get("duration_to")
+    duration_min = item.get("trip_duration")
 
     transfers = item.get("number_of_changes")
     if transfers is None:
