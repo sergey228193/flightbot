@@ -413,6 +413,11 @@ def format_flight_item(item: dict, route: Route) -> str:
     if night_markers:
         lines.append("🌙 " + ", ".join(night_markers))
 
+    if route.transfer_hint:
+        lines.append(f"🛩 {route.transfer_hint}")
+    else:
+        lines.append("🛩 прямой рейс")
+
     return "\n".join(lines)
 
 
@@ -447,12 +452,10 @@ async def build_schedule_text(person: Person) -> str:
                     lines.append("➖➖➖➖➖➖➖➖")
                 lines.append(format_flight_item(item, route))
 
-    if any(r.destination in (LONDON, CORFU, BERLIN) for r in person.routes):
-        lines.append(
-            "\n⚠️ Прямых рейсов Россия—ЕС/Великобритания нет с 2022 года "
-            "(санкции и зеркальные ограничения). Все варианты выше — с пересадкой "
-            "(обычно через Стамбул, Дубай, Белград, Ереван и т.п.)."
-        )
+    lines.append(
+        "\nℹ️ Тут присутствуют не все рейсы, а те, которые зарегистрированы в программе, "
+        "но они точные — если нужна определённая дата или время, гуглите сами😋"
+    )
 
     return "\n".join(lines)
 
