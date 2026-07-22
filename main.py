@@ -82,6 +82,11 @@ class Route:
     origin_name: str
     destination: str
     destination_name: str
+    # Справочная информация (примерная, не из API) — показывается в скобках
+    # рядом с названием маршрута, чтобы сразу было понятно, чего ждать.
+    transfer_hint: Optional[str] = None      # где обычно пересадка
+    approx_duration: str = ""                # сколько примерно лететь суммарно
+    approx_arrival: str = ""                  # когда примерно приземление
 
 
 @dataclass(frozen=True)
@@ -100,33 +105,78 @@ PEOPLE = {
         key="sergey",
         display_name="Сергей",
         routes=(
-            Route(MOSCOW, "Москва", LONDON, "Лондон"),
-            Route(SPB, "Санкт-Петербург", LONDON, "Лондон"),
+            Route(
+                MOSCOW, "Москва", LONDON, "Лондон",
+                transfer_hint="обычно через Стамбул, Белград или Ереван",
+                approx_duration="~10–13 ч в пути суммарно",
+                approx_arrival="прилёт вечером или ночью того же/следующего дня",
+            ),
+            Route(
+                SPB, "Санкт-Петербург", LONDON, "Лондон",
+                transfer_hint="обычно через Стамбул, Белград или Ереван",
+                approx_duration="~10–13 ч в пути суммарно",
+                approx_arrival="прилёт вечером или ночью того же/следующего дня",
+            ),
         ),
     ),
     "darya": Person(
         key="darya",
         display_name="Дарья",
         routes=(
-            Route(MOSCOW, "Москва", CORFU, "Корфу"),
-            Route(SPB, "Санкт-Петербург", CORFU, "Корфу"),
+            Route(
+                MOSCOW, "Москва", CORFU, "Корфу",
+                transfer_hint="обычно через Стамбул или Афины",
+                approx_duration="~7–10 ч в пути суммарно",
+                approx_arrival="прилёт днём или вечером того же дня",
+            ),
+            Route(
+                SPB, "Санкт-Петербург", CORFU, "Корфу",
+                transfer_hint="обычно через Стамбул или Афины",
+                approx_duration="~7–10 ч в пути суммарно",
+                approx_arrival="прилёт днём или вечером того же дня",
+            ),
         ),
     ),
     "valeria": Person(
         key="valeria",
         display_name="Валерия",
         routes=(
-            Route(MOSCOW, "Москва", BANGKOK, "Бангкок"),
-            Route(SPB, "Санкт-Петербург", BANGKOK, "Бангкок"),
+            Route(
+                MOSCOW, "Москва", BANGKOK, "Бангкок",
+                transfer_hint=None,  # прямой рейс, пересадки нет
+                approx_duration="~9 ч в пути (прямой рейс)",
+                approx_arrival="прилёт ранним утром по местному времени, на следующие сутки",
+            ),
+            Route(
+                SPB, "Санкт-Петербург", BANGKOK, "Бангкок",
+                transfer_hint="обычно через Москву (прямых рейсов из СПб нет)",
+                approx_duration="~11–13 ч в пути суммарно",
+                approx_arrival="прилёт утром по местному времени, на следующие сутки",
+            ),
         ),
     ),
     "maxim": Person(
         key="maxim",
         display_name="Максим",
         routes=(
-            Route(MOSCOW, "Москва", BERLIN, "Берлин"),
-            Route(SPB, "Санкт-Петербург", BERLIN, "Берлин"),
-            Route(KRASNODAR, "Краснодар", BERLIN, "Берлин"),
+            Route(
+                MOSCOW, "Москва", BERLIN, "Берлин",
+                transfer_hint="обычно через Стамбул или Белград",
+                approx_duration="~9–12 ч в пути суммарно",
+                approx_arrival="прилёт вечером того же дня или ночью",
+            ),
+            Route(
+                SPB, "Санкт-Петербург", BERLIN, "Берлин",
+                transfer_hint="обычно через Стамбул или Белград",
+                approx_duration="~9–12 ч в пути суммарно",
+                approx_arrival="прилёт вечером того же дня или ночью",
+            ),
+            Route(
+                KRASNODAR, "Краснодар", BERLIN, "Берлин",
+                transfer_hint="обычно через Стамбул или Москву",
+                approx_duration="~10–13 ч в пути суммарно",
+                approx_arrival="прилёт вечером того же дня или ночью",
+            ),
         ),
     ),
 }
@@ -332,6 +382,17 @@ async def build_schedule_text(person: Person) -> str:
     async with aiohttp.ClientSession() as session:
         for route in person.routes:
             lines.append(f"\n<b>{route.origin_name} ({route.origin}) → {route.destination_name} ({route.destination})</b>")
+
+            hint_parts = []
+            if route.transfer_hint:
+                hint_parts.append(route.transfer_hint)
+            if route.approx_duration:
+                hint_parts.append(route.approx_duration)
+            if route.approx_arrival:
+                hint_parts.append(route.approx_arrival)
+            if hint_parts:
+                lines.append(f"<i>({'; '.join(hint_parts)})</i>")
+
             flights = await fetch_flights_for_route(session, route)
             if not flights:
                 lines.append("Нет данных / вариантов на эту дату в кэше Aviasales.")
