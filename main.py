@@ -243,13 +243,17 @@ def _build_query(origin: str, destination: str, depart_month: str, fields: str, 
 
 async def _graphql_request(session: aiohttp.ClientSession, query: str) -> Optional[dict]:
     headers = {"Content-Type": "application/json", "X-Access-Token": TRAVELPAYOUTS_TOKEN}
+    timeout = aiohttp.ClientTimeout(total=15)
     try:
-        async with session.post(GRAPHQL_URL, json={"query": query}, headers=headers, timeout=20) as resp:
+        async with session.post(GRAPHQL_URL, json={"query": query}, headers=headers, timeout=timeout) as resp:
             data = await resp.json()
             if resp.status != 200:
                 log.warning("GraphQL вернул статус %s: %s", resp.status, data)
                 return None
             return data
+    except asyncio.TimeoutError:
+        log.warning("GraphQL-запрос не уложился в 15 секунд (таймаут)")
+        return None
     except Exception as exc:  # noqa: BLE001
         log.error("Ошибка GraphQL-запроса к Travelpayouts: %s", exc)
         return None
@@ -284,17 +288,21 @@ async def fetch_flights_for_route(session: aiohttp.ClientSession, route: Route) 
 
     all_items: list[dict] = []
     for month in months:
+        log.info("Запрашиваю рейсы %s->%s на %s", route.origin, route.destination, month)
+
         # Попытка 1: расширенные поля + явная валюта
         query = _build_query(route.origin, route.destination, month, FIELDS_FULL, with_currency=True)
         data = await _graphql_request(session, query)
 
         if data is None or data.get("errors"):
+            log.info("Попытка 1 (FULL+currency) не удалась для %s->%s (%s), пробую без currency", route.origin, route.destination, month)
             # Попытка 2: те же расширенные поля (авиакомпания, длительность,
             # пересадки), но без currency — вдруг проблема была именно в нём.
             query = _build_query(route.origin, route.destination, month, FIELDS_FULL, with_currency=False)
             data = await _graphql_request(session, query)
 
         if data is None or data.get("errors"):
+            log.info("Попытка 2 (FULL без currency) не удалась для %s->%s (%s), пробую базовые поля", route.origin, route.destination, month)
             # Попытка 3 (последний резерв): минимальный набор полей —
             # ровно как в официальном примере документации Travelpayouts.
             # Тут уже не будет airline/number_of_changes.
@@ -302,6 +310,7 @@ async def fetch_flights_for_route(session: aiohttp.ClientSession, route: Route) 
             data = await _graphql_request(session, query)
 
         if not data:
+            log.warning("Все попытки не удались для %s->%s (%s) — пропускаю месяц", route.origin, route.destination, month)
             continue
         if data.get("errors"):
             log.warning("GraphQL errors для %s->%s (%s): %s", route.origin, route.destination, month, data["errors"])
@@ -428,7 +437,13 @@ async def build_schedule_text(person: Person) -> str:
     ]
 
     async with aiohttp.ClientSession() as session:
-        for route in person.routes:
+        # Запрашиваем все маршруты человека ПАРАЛЛЕЛЬНО, а не по очереди —
+        # иначе при 2-3 направлениях бот может отвечать по 1-2 минуты.
+        flights_per_route = await asyncio.gather(
+            *(fetch_flights_for_route(session, route) for route in person.routes)
+        )
+
+        for route, flights in zip(person.routes, flights_per_route):
             lines.append(f"\n<b>{route.origin_name} ({route.origin}) → {route.destination_name} ({route.destination})</b>")
 
             hint_parts = []
@@ -440,8 +455,6 @@ async def build_schedule_text(person: Person) -> str:
                 hint_parts.append(route.approx_arrival)
             if hint_parts:
                 lines.append(f"<i>({'; '.join(hint_parts)})</i>")
-
-            flights = await fetch_flights_for_route(session, route)
 
             if not flights:
                 lines.append("Нет данных / вариантов на эту дату в кэше Aviasales.")
@@ -463,6 +476,29 @@ async def build_schedule_text(person: Person) -> str:
 # ---------------------------------------------------------------------------
 # TELEGRAM-БОТ
 # ---------------------------------------------------------------------------
+
+SEARCH_TIMEOUT_SECONDS = 45
+
+
+async def build_schedule_text_safe(person: Person) -> str:
+    """
+    Обёртка над build_schedule_text с жёстким общим таймаутом.
+
+    Без этого бот мог "молчать" по 1-4 минуты, если Travelpayouts
+    отвечает медленно или не отвечает вовсе (и это выглядело как зависание).
+    Теперь, если поиск не уложился в SEARCH_TIMEOUT_SECONDS, пользователь
+    сразу получает понятное сообщение вместо тишины.
+    """
+    try:
+        return await asyncio.wait_for(build_schedule_text(person), timeout=SEARCH_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        log.warning("Поиск рейсов для %s не уложился в %s секунд", person.display_name, SEARCH_TIMEOUT_SECONDS)
+        return (
+            f"<b>Расписание для {person.display_name}</b>\n\n"
+            "⚠️ Travelpayouts сейчас отвечает слишком долго, не получилось собрать расписание вовремя.\n"
+            "Попробуй нажать «🔄 Обновить расписание» через минуту."
+        )
+
 
 router = Router()
 
@@ -503,7 +539,7 @@ async def cmd_schedule(message: Message) -> None:
         return
     person = PEOPLE[person_key]
     await message.answer("Ищу актуальные варианты, секунду…")
-    text = await build_schedule_text(person)
+    text = await build_schedule_text_safe(person)
     await message.answer(text, reply_markup=refresh_keyboard())
 
 
@@ -512,7 +548,7 @@ async def handle_name_choice(message: Message) -> None:
     person = person_by_name(message.text)
     CHAT_TO_PERSON[message.chat.id] = person.key
     await message.answer(f"Отлично, {person.display_name}! Ищу актуальные варианты, секунду…")
-    text = await build_schedule_text(person)
+    text = await build_schedule_text_safe(person)
     await message.answer(text, reply_markup=refresh_keyboard())
 
 
@@ -526,7 +562,7 @@ async def handle_refresh(callback: CallbackQuery) -> None:
     person = PEOPLE[person_key]
     await callback.answer("Обновляю…")
 
-    text = await build_schedule_text(person)
+    text = await build_schedule_text_safe(person)
 
     chat_id = callback.message.chat.id
     old_message_id = callback.message.message_id
@@ -551,7 +587,7 @@ async def daily_broadcast(bot: Bot) -> None:
         if not person:
             continue
         try:
-            text = await build_schedule_text(person)
+            text = await build_schedule_text_safe(person)
             await bot.send_message(chat_id, "🔔 Ежедневное обновление\n\n" + text, reply_markup=refresh_keyboard())
         except Exception as exc:  # noqa: BLE001
             log.error("Не удалось отправить рассылку в чат %s: %s", chat_id, exc)
