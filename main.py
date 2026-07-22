@@ -26,7 +26,8 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Optional
 
 import aiohttp
@@ -279,7 +280,7 @@ async def fetch_flights_for_route(session: aiohttp.ClientSession, route: Route) 
     а не «расписание вообще всех рейсов» — если по каким-то датам никто
     ничего не искал/покупал, по ним не будет данных вовсе.
     """
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now(ZoneInfo(TIMEZONE)).date()
     months = _month_starts(today, DEADLINE)
 
     all_items: list[dict] = []
@@ -304,7 +305,10 @@ async def fetch_flights_for_route(session: aiohttp.ClientSession, route: Route) 
         dep_dt = _parse_departure(item)
         if dep_dt is None:
             continue
-        if dep_dt.date() <= DEADLINE:
+        # Нижняя граница: не показываем рейсы, которые уже улетели сегодня
+        # или раньше — иначе старые даты могли "зависать" в выдаче, если
+        # они случайно остались в кэше Aviasales.
+        if today <= dep_dt.date() <= DEADLINE:
             filtered.append(item)
 
     filtered.sort(key=lambda x: (_parse_departure(x) or datetime.max))
