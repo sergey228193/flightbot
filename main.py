@@ -31,6 +31,7 @@ from typing import Optional
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
@@ -45,8 +46,8 @@ from aiogram.types import (
 # НАСТРОЙКИ
 # ---------------------------------------------------------------------------
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8679015857:AAHcQYd1sDpbQh14C-RmGiQXcpcx3CIr3mk")
-TRAVELPAYOUTS_TOKEN = os.environ.get("TRAVELPAYOUTS_TOKEN", "656b062c46e3d253140b45d9d8a8ddd3")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "ВСТАВЬ_СЮДА_ТОКЕН_БОТА")
+TRAVELPAYOUTS_TOKEN = os.environ.get("TRAVELPAYOUTS_TOKEN", "ВСТАВЬ_СЮДА_ТОКЕН_TRAVELPAYOUTS")
 
 # Валюта отображения цен
 CURRENCY = "rub"
@@ -287,7 +288,7 @@ async def handle_refresh(callback: CallbackQuery) -> None:
 
 
 async def main() -> None:
-    bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher()
     dp.include_router(router)
     log.info("Бот запущен")
