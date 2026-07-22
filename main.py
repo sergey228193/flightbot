@@ -26,7 +26,7 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import aiohttp
@@ -198,13 +198,11 @@ CHAT_TO_PERSON: dict[int, str] = {}
 
 GRAPHQL_URL = "https://api.travelpayouts.com/graphql/v1/query"
 
-# Поля, которые пробуем запросить сначала (расширенный набор).
-FIELDS_FULL = "departure_at value trip_duration number_of_changes airline"
-# Если запрос с currency почему-то падает, пробуем те же поля без currency —
-# так авиакомпания и длительность полёта не теряются зря.
-# Если API не знает какое-то из полей выше, откатываемся на минимальный набор,
-# который точно подтверждён документацией Travelpayouts (последний резерв).
-FIELDS_BASIC = "departure_at value trip_duration"
+# Поля, которые реально поддерживает GraphQL prices_one_way (проверено по
+# ответам API): currency в params и airline в Price НЕ существуют — попытка
+# их запросить всегда возвращает ошибку валидации, поэтому раньше бот
+# впустую тратил 2 из 3 попыток на каждый месяц/маршрут.
+FIELDS_FULL = "departure_at value trip_duration number_of_changes"
 
 
 def _month_starts(start: date, end: date) -> list[str]:
@@ -221,8 +219,7 @@ def _month_starts(start: date, end: date) -> list[str]:
     return months
 
 
-def _build_query(origin: str, destination: str, depart_month: str, fields: str, with_currency: bool) -> str:
-    currency_line = f'currency: "{CURRENCY}"' if with_currency else ""
+def _build_query(origin: str, destination: str, depart_month: str, fields: str) -> str:
     return f"""
 {{
   prices_one_way(
@@ -230,7 +227,6 @@ def _build_query(origin: str, destination: str, depart_month: str, fields: str, 
       origin: "{origin}"
       destination: "{destination}"
       depart_months: "{depart_month}"
-      {currency_line}
     }}
     paging: {{ limit: 30, offset: 0 }}
     sorting: VALUE_ASC
@@ -283,34 +279,18 @@ async def fetch_flights_for_route(session: aiohttp.ClientSession, route: Route) 
     а не «расписание вообще всех рейсов» — если по каким-то датам никто
     ничего не искал/покупал, по ним не будет данных вовсе.
     """
-    today = datetime.utcnow().date()
+    today = datetime.now(timezone.utc).date()
     months = _month_starts(today, DEADLINE)
 
     all_items: list[dict] = []
     for month in months:
         log.info("Запрашиваю рейсы %s->%s на %s", route.origin, route.destination, month)
 
-        # Попытка 1: расширенные поля + явная валюта
-        query = _build_query(route.origin, route.destination, month, FIELDS_FULL, with_currency=True)
+        query = _build_query(route.origin, route.destination, month, FIELDS_FULL)
         data = await _graphql_request(session, query)
 
-        if data is None or data.get("errors"):
-            log.info("Попытка 1 (FULL+currency) не удалась для %s->%s (%s), пробую без currency", route.origin, route.destination, month)
-            # Попытка 2: те же расширенные поля (авиакомпания, длительность,
-            # пересадки), но без currency — вдруг проблема была именно в нём.
-            query = _build_query(route.origin, route.destination, month, FIELDS_FULL, with_currency=False)
-            data = await _graphql_request(session, query)
-
-        if data is None or data.get("errors"):
-            log.info("Попытка 2 (FULL без currency) не удалась для %s->%s (%s), пробую базовые поля", route.origin, route.destination, month)
-            # Попытка 3 (последний резерв): минимальный набор полей —
-            # ровно как в официальном примере документации Travelpayouts.
-            # Тут уже не будет airline/number_of_changes.
-            query = _build_query(route.origin, route.destination, month, FIELDS_BASIC, with_currency=False)
-            data = await _graphql_request(session, query)
-
         if not data:
-            log.warning("Все попытки не удались для %s->%s (%s) — пропускаю месяц", route.origin, route.destination, month)
+            log.warning("Запрос не удался для %s->%s (%s) — пропускаю месяц", route.origin, route.destination, month)
             continue
         if data.get("errors"):
             log.warning("GraphQL errors для %s->%s (%s): %s", route.origin, route.destination, month, data["errors"])
@@ -502,6 +482,45 @@ async def build_schedule_text_safe(person: Person) -> str:
 
 router = Router()
 
+# Telegram режет сообщения длиннее 4096 символов и просто не отправляет их
+# ("message is too long"), если отправить как есть. Разбиваем по строкам,
+# чтобы не порвать HTML-теги (каждая строка карточки самодостаточна:
+# <b>...</b> и <i>...</i> открываются и закрываются в одной строке).
+TELEGRAM_MESSAGE_LIMIT = 3500
+
+
+def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
+    lines = text.split("\n")
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    for line in lines:
+        line_len = len(line) + 1  # +1 за перенос строки
+        if current and current_len + line_len > limit:
+            chunks.append("\n".join(current))
+            current = []
+            current_len = 0
+        current.append(line)
+        current_len += line_len
+
+    if current:
+        chunks.append("\n".join(current))
+
+    return chunks or [""]
+
+
+async def send_schedule_message(bot: Bot, chat_id: int, text: str, reply_markup: InlineKeyboardMarkup) -> None:
+    """Отправляет расписание, разбивая на несколько сообщений при необходимости.
+
+    Кнопка "Обновить" вешается только на последнее сообщение части — чтобы
+    не плодить по кнопке под каждым куском.
+    """
+    chunks = split_message(text)
+    for i, chunk in enumerate(chunks):
+        is_last = i == len(chunks) - 1
+        await bot.send_message(chat_id, chunk, reply_markup=reply_markup if is_last else None)
+
 
 def people_keyboard() -> ReplyKeyboardMarkup:
     buttons = [[KeyboardButton(text=p.display_name)] for p in PEOPLE.values()]
@@ -540,7 +559,7 @@ async def cmd_schedule(message: Message) -> None:
     person = PEOPLE[person_key]
     await message.answer("Ищу актуальные варианты, секунду…")
     text = await build_schedule_text_safe(person)
-    await message.answer(text, reply_markup=refresh_keyboard())
+    await send_schedule_message(message.bot, message.chat.id, text, refresh_keyboard())
 
 
 @router.message(F.text.func(lambda t: person_by_name(t) is not None))
@@ -549,7 +568,7 @@ async def handle_name_choice(message: Message) -> None:
     CHAT_TO_PERSON[message.chat.id] = person.key
     await message.answer(f"Отлично, {person.display_name}! Ищу актуальные варианты, секунду…")
     text = await build_schedule_text_safe(person)
-    await message.answer(text, reply_markup=refresh_keyboard())
+    await send_schedule_message(message.bot, message.chat.id, text, refresh_keyboard())
 
 
 @router.callback_query(F.data == "refresh")
@@ -567,16 +586,15 @@ async def handle_refresh(callback: CallbackQuery) -> None:
     chat_id = callback.message.chat.id
     old_message_id = callback.message.message_id
 
-    # Сначала отправляем новое сообщение, потом удаляем старое —
-    # так пользователь не остаётся без сообщения, если удаление вдруг не удастся.
-    new_message = await callback.bot.send_message(chat_id, text, reply_markup=refresh_keyboard())
+    # Сначала отправляем новое сообщение (возможно, несколько частей),
+    # потом удаляем старое — так пользователь не остаётся без сообщения,
+    # если удаление вдруг не удастся.
+    await send_schedule_message(callback.bot, chat_id, text, refresh_keyboard())
 
     try:
         await callback.bot.delete_message(chat_id, old_message_id)
     except TelegramBadRequest as exc:
         log.warning("Не удалось удалить старое сообщение %s в чате %s: %s", old_message_id, chat_id, exc)
-
-    _ = new_message  # оставлено для наглядности, можно расширить логику при желании
 
 
 async def daily_broadcast(bot: Bot) -> None:
@@ -588,7 +606,7 @@ async def daily_broadcast(bot: Bot) -> None:
             continue
         try:
             text = await build_schedule_text_safe(person)
-            await bot.send_message(chat_id, "🔔 Ежедневное обновление\n\n" + text, reply_markup=refresh_keyboard())
+            await send_schedule_message(bot, chat_id, "🔔 Ежедневное обновление\n\n" + text, refresh_keyboard())
         except Exception as exc:  # noqa: BLE001
             log.error("Не удалось отправить рассылку в чат %s: %s", chat_id, exc)
 
